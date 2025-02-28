@@ -1,0 +1,4 @@
+debug/
+target/
+*.swp
+Cargo.lock
