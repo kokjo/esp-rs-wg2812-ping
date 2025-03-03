@@ -3,6 +3,9 @@ runner = "espflash flash --monitor"
 
 [env]
 ESP_LOG="INFO"
+SSID="Wifi AP name"
+PASSWORD="password"
+
 
 [build]
 rustflags = [
