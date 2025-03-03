@@ -3,8 +3,12 @@
 
 use alloc::collections::BTreeMap;
 use embassy_executor::Spawner;
+use embassy_net::udp::UdpSocket;
+use embassy_net::Stack;
 use embassy_net::{udp::PacketMetadata, IpListenEndpoint, Runner, StackResources};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::channel;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -39,11 +43,19 @@ macro_rules! mk_static {
     }};
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+type RGB = [u8; 3];
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Event {
     Ping,
     Click,
 }
+
+const NUM_EVENTS: usize = 10;
+
+type EventChannel = channel::Channel<NoopRawMutex, Event, NUM_EVENTS>;
+type EventSender = channel::Sender<'static, NoopRawMutex, Event, NUM_EVENTS>;
+type EventReceiver = channel::Receiver<'static, NoopRawMutex, Event, NUM_EVENTS>;
 
 const NUM_PIXELS: usize = 300;
 
@@ -76,14 +88,18 @@ impl<'d> WS2812Controller<'d> {
 
     pub async fn send_pixels(
         &mut self,
-        pixels: impl Iterator<Item = [u8; 3]>,
+        pixels: impl Iterator<Item = RGB>,
     ) -> Result<(), spi::Error> {
         let mut pulses = [0u8; 3 * 3 * NUM_PIXELS];
         let mut bitoff = 0;
         for pixel in pixels {
             let pixel = ((pixel[1] as u32) << 16) | ((pixel[0] as u32) << 8) | (pixel[2] as u32);
             for j in 0..24 {
-                let bitpulse = if (pixel >> j) & 1 == 1 { 0b110 } else { 0b100 };
+                let bitpulse = if (pixel >> (23 - j)) & 1 == 1 {
+                    0b110
+                } else {
+                    0b100
+                };
                 for k in 0..3 {
                     let bit = (bitpulse >> k) & 1;
                     pulses[bitoff / u8::BITS as usize] |= bit << (7 - (bitoff % u8::BITS as usize));
@@ -108,10 +124,7 @@ async fn main(spawner: Spawner) {
     esp_hal_embassy::init(timer0.alarm0);
     info!("Embassy initialized!");
 
-    let events = mk_static!(
-        channel::Channel::<CriticalSectionRawMutex, Event, 10>,
-        channel::Channel::<CriticalSectionRawMutex, Event, 10>::new()
-    );
+    let events = mk_static!(EventChannel, EventChannel::new());
 
     let mut rng = Rng::new(peripherals.RNG);
 
@@ -120,7 +133,12 @@ async fn main(spawner: Spawner) {
         WS2812Controller::new(peripherals.SPI2, peripherals.GPIO4, peripherals.DMA_CH0)
     );
 
-    spawner.must_spawn(ws2812_task(events.receiver(), ws2812_ctrl, rng.clone()));
+    let pixels = mk_static!(
+        Mutex<NoopRawMutex, [RGB; NUM_PIXELS]>,
+        Mutex::new([RGB::default(); NUM_PIXELS])
+    ) as &'static _;
+
+    spawner.must_spawn(ws2812_task(events.receiver(), ws2812_ctrl, pixels));
 
     // Start button task
     let btn = mk_static!(Input, Input::new(peripherals.GPIO9, Pull::None));
@@ -131,7 +149,7 @@ async fn main(spawner: Spawner) {
 
     let esp_wifi_ctrl = &*mk_static!(
         EspWifiController<'static>,
-        init(timg0.timer0, rng.clone(), peripherals.RADIO_CLK).unwrap()
+        init(timg0.timer0, rng, peripherals.RADIO_CLK).unwrap()
     );
 
     let (wifi_sta, wifi_ctrl) =
@@ -164,34 +182,8 @@ async fn main(spawner: Spawner) {
         Timer::after_millis(500).await;
     }
 
-    let mut rx_data = [0u8; 4096];
-    let mut rx_meta = [PacketMetadata::EMPTY; 2];
-
-    let mut tx_data = [0u8; 4096];
-    let mut tx_meta = [PacketMetadata::EMPTY; 2];
-
-    let mut sock = embassy_net::udp::UdpSocket::new(
-        stack.clone(),
-        &mut rx_meta,
-        &mut rx_data,
-        &mut tx_meta,
-        &mut tx_data,
-    );
-
-    sock.bind(IpListenEndpoint {
-        addr: None,
-        port: 1337,
-    })
-    .unwrap();
-
-    let mut packet = [0u8; 1024];
-
-    loop {
-        let (size, meta) = sock.recv_from(&mut packet).await.unwrap();
-        info!("Got UDP ping");
-        sock.send_to(&packet[..size], meta.endpoint).await.unwrap();
-        events.send(Event::Ping).await;
-    }
+    spawner.must_spawn(pixelping(stack, events.sender()));
+    spawner.must_spawn(pixelflute(stack, pixels));
 }
 
 #[embassy_executor::task]
@@ -225,12 +217,46 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDevice>
 }
 
 #[embassy_executor::task]
+async fn pixelping(stack: Stack<'static>, events: EventSender) {
+    let mut rx_data = [0u8; 4096];
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+
+    let mut tx_data = [0u8; 4096];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+
+    let mut sock = UdpSocket::new(
+        stack,
+        &mut rx_meta,
+        &mut rx_data,
+        &mut tx_meta,
+        &mut tx_data,
+    );
+
+    sock.bind(IpListenEndpoint {
+        addr: None,
+        port: 1337,
+    })
+    .unwrap();
+
+    let mut packet = [0u8; 1024];
+
+    loop {
+        let (size, meta) = sock.recv_from(&mut packet).await.unwrap();
+        info!("Got UDP ping");
+        sock.send_to(&packet[..size], meta.endpoint).await.unwrap();
+        events.send(Event::Ping).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn ws2812_task(
-    events: channel::Receiver<'static, CriticalSectionRawMutex, Event, 10>,
+    events: EventReceiver,
     ws2812_ctrl: &'static mut WS2812Controller<'static>,
-    mut rng: Rng,
+    pixels: &'static Mutex<NoopRawMutex, [RGB; NUM_PIXELS]>,
 ) {
     let mut lights: BTreeMap<i32, [u8; 3]> = BTreeMap::new();
+
+    let mut next_color = 0;
 
     let colors = [
         [0xff, 0x00, 0x00],
@@ -246,25 +272,34 @@ async fn ws2812_task(
         [0xff, 0xff, 0xff],
     ];
 
-    let mut dir = 1;
-
     loop {
-        let pixels = (0..NUM_PIXELS as i32).map(|i| lights.get(&i).cloned().unwrap_or_default());
+        let pixels_copy = *pixels.lock().await;
 
-        ws2812_ctrl.send_pixels(pixels).await.unwrap();
+        let data = (0..NUM_PIXELS as i32)
+            .map(|i| lights.get(&i).cloned().unwrap_or(pixels_copy[i as usize]));
+
+        ws2812_ctrl.send_pixels(data).await.unwrap();
 
         lights = lights
             .into_iter()
-            .filter_map(|(i, rgb)| (0 <= i && i <= NUM_PIXELS as i32).then_some((i + dir, rgb)))
+            .filter_map(|(i, rgb)| (i < NUM_PIXELS as i32).then_some((i + 1, rgb)))
             .collect();
 
-        let event = events.try_receive();
-
-        if event == Ok(Event::Ping) || lights.is_empty() {
-            let color = colors[(rng.random() as usize) % colors.len()];
-            lights.insert((dir == 1).then_some(0).unwrap_or(NUM_PIXELS as i32), color);
-        } else if event == Ok(Event::Click) {
-            dir = -dir;
+        while let Ok(event) = events.try_receive() {
+            match event {
+                Event::Ping => {
+                    let color = colors[next_color % colors.len()];
+                    next_color += 1;
+                    lights.insert(0, color);
+                }
+                Event::Click => {
+                    pixels
+                        .lock()
+                        .await
+                        .iter_mut()
+                        .for_each(|pixel| *pixel = [0, 0, 0]);
+                }
+            }
         }
 
         Timer::after(Duration::from_millis(1)).await;
@@ -272,13 +307,73 @@ async fn ws2812_task(
 }
 
 #[embassy_executor::task]
-async fn btn_task(
-    btn: &'static mut Input<'static>,
-    events: channel::Sender<'static, CriticalSectionRawMutex, Event, 10>,
-) {
+async fn btn_task(btn: &'static mut Input<'static>, events: EventSender) {
     loop {
         btn.wait_for_falling_edge().await;
         info!("Button clicked!");
         events.send(Event::Click).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn pixelflute(
+    stack: Stack<'static>,
+    pixels: &'static Mutex<NoopRawMutex, [RGB; NUM_PIXELS]>,
+) {
+    let mut rx_data = [0u8; 4096];
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+
+    let mut tx_data = [0u8; 4096];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+
+    let mut sock = UdpSocket::new(
+        stack,
+        &mut rx_meta,
+        &mut rx_data,
+        &mut tx_meta,
+        &mut tx_data,
+    );
+
+    sock.bind(IpListenEndpoint {
+        addr: None,
+        port: 4242,
+    })
+    .unwrap();
+
+    let mut packet = [0; 1500];
+
+    loop {
+        let (size, meta) = sock.recv_from(&mut packet).await.unwrap();
+        if size < 2 {
+            sock.send_to(b"Pixelflute packet too short", meta.endpoint)
+                .await
+                .unwrap();
+            continue;
+        }
+
+        let format = packet[0];
+        let version = packet[1];
+
+        info!(
+            "Got pixelflute packet, size: {}, version: {}, format: {}",
+            size, version, format
+        );
+
+        if format != 0 && version != 1 {
+            sock.send_to(
+                b"This Pixel flute only supports version 1 with format 0(xyrgb 16:16:8:8:8)",
+                meta.endpoint,
+            )
+            .await
+            .unwrap();
+            continue;
+        }
+
+        for pixel in packet[2..size].chunks_exact(7) {
+            let x = u16::from_le_bytes(pixel[0..2].try_into().unwrap());
+            let y = u16::from_le_bytes(pixel[2..4].try_into().unwrap());
+            let rgb = [pixel[4], pixel[5], pixel[6]];
+            pixels.lock().await[(x as usize) % NUM_PIXELS] = rgb;
+        }
     }
 }
