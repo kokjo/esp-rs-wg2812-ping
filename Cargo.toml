@@ -54,6 +54,9 @@ esp-hal-embassy  = { version = "0.6.0", features = ["esp32c3"] }
 static_cell      = { version = "2.1.0", features = ["nightly"] }
 embassy-sync = "0.6.2"
 embassy-futures = "0.1.1"
+edge-nal = "0.5.0"
+edge-mdns = "0.5.0"
+edge-nal-embassy = "0.5.0"
 
 [profile.dev]
 # Rust debug is too slow.

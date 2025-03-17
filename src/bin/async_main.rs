@@ -1,7 +1,16 @@
 #![no_std]
 #![no_main]
 
+use core::net::{Ipv4Addr, Ipv6Addr};
+
 use alloc::collections::BTreeMap;
+use edge_mdns::buf::VecBufAccess;
+use edge_mdns::domain::base::Ttl;
+use edge_mdns::host::Host;
+use edge_mdns::io::{Mdns, DEFAULT_SOCKET};
+use edge_mdns::HostAnswersMdnsHandler;
+use edge_nal::{UdpBind as _, UdpSplit as _};
+use edge_nal_embassy::{Udp, UdpBuffers};
 use embassy_executor::Spawner;
 use embassy_net::udp::UdpSocket;
 use embassy_net::Stack;
@@ -9,6 +18,7 @@ use embassy_net::{udp::PacketMetadata, IpListenEndpoint, Runner, StackResources}
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel;
 use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -57,7 +67,7 @@ type EventChannel = channel::Channel<NoopRawMutex, Event, NUM_EVENTS>;
 type EventSender = channel::Sender<'static, NoopRawMutex, Event, NUM_EVENTS>;
 type EventReceiver = channel::Receiver<'static, NoopRawMutex, Event, NUM_EVENTS>;
 
-const NUM_PIXELS: usize = 300;
+const NUM_PIXELS: usize = 600;
 
 struct WS2812Controller<'d> {
     spidma: spi::master::SpiDmaBus<'d, Async>,
@@ -70,13 +80,13 @@ impl<'d> WS2812Controller<'d> {
         channel: impl Peripheral<P = impl DmaChannelFor<spi::AnySpi>> + 'd,
     ) -> Self {
         let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
-            dma_buffers!(3 * 3 * NUM_PIXELS);
+            dma_buffers!(3 * 4 * NUM_PIXELS);
         let dma_rx_buf = dma::DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
         let dma_tx_buf = dma::DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
         Self {
             spidma: spi::master::Spi::new(
                 spi,
-                spi::master::Config::default().with_frequency(2500u32.kHz()),
+                spi::master::Config::default().with_frequency(3200u32.kHz()),
             )
             .unwrap()
             .with_mosi(pin)
@@ -90,17 +100,17 @@ impl<'d> WS2812Controller<'d> {
         &mut self,
         pixels: impl Iterator<Item = RGB>,
     ) -> Result<(), spi::Error> {
-        let mut pulses = [0u8; 3 * 3 * NUM_PIXELS];
+        let mut pulses = [0u8; 3 * 4 * NUM_PIXELS];
         let mut bitoff = 0;
         for pixel in pixels {
             let pixel = ((pixel[1] as u32) << 16) | ((pixel[0] as u32) << 8) | (pixel[2] as u32);
             for j in 0..24 {
                 let bitpulse = if (pixel >> (23 - j)) & 1 == 1 {
-                    0b110
+                    0b0111
                 } else {
-                    0b100
+                    0b0001
                 };
-                for k in 0..3 {
+                for k in 0..4 {
                     let bit = (bitpulse >> k) & 1;
                     pulses[bitoff / u8::BITS as usize] |= bit << (7 - (bitoff % u8::BITS as usize));
                     bitoff += 1;
@@ -136,7 +146,7 @@ async fn main(spawner: Spawner) {
     let pixels = mk_static!(
         Mutex<NoopRawMutex, [RGB; NUM_PIXELS]>,
         Mutex::new([RGB::default(); NUM_PIXELS])
-    ) as &'static _;
+    );
 
     spawner.must_spawn(ws2812_task(events.receiver(), ws2812_ctrl, pixels));
 
@@ -160,7 +170,7 @@ async fn main(spawner: Spawner) {
     let (stack, runner) = embassy_net::new(
         wifi_sta,
         embassy_net::Config::dhcpv4(Default::default()),
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<5>, StackResources::<5>::new()),
         (rng.random() as u64) << 32 | rng.random() as u64,
     );
     spawner.must_spawn(net_task(runner));
@@ -184,6 +194,42 @@ async fn main(spawner: Spawner) {
 
     spawner.must_spawn(pixelping(stack, events.sender()));
     spawner.must_spawn(pixelflute(stack, pixels));
+    spawner.must_spawn(mdns_task(stack, "pixelflute"));
+}
+
+#[embassy_executor::task]
+async fn mdns_task(stack: Stack<'static>, hostname: &'static str) {
+        let mdns_udp_buff = UdpBuffers::<1, 1024, 1024, 1>::new();
+    let mdns_udp = Udp::new(stack, &mdns_udp_buff);
+    let mut mdns_udp_sock = mdns_udp.bind(DEFAULT_SOCKET).await.unwrap();
+    let (mdns_rx, mdns_tx) = mdns_udp_sock.split();
+    let (recv_buf, send_buf) = (
+        VecBufAccess::<NoopRawMutex, 1500>::new(),
+        VecBufAccess::<NoopRawMutex, 1500>::new(),
+    );
+
+    let signal = Signal::<NoopRawMutex, ()>::new();
+
+    let mdns = Mdns::<NoopRawMutex, _, _, _, _>::new(
+        Some(Ipv4Addr::UNSPECIFIED),
+        None,
+        mdns_rx,
+        mdns_tx,
+        recv_buf,
+        send_buf,
+        |buf| buf.iter_mut().for_each(|x| *x = 0),
+        &signal
+    );
+
+    loop {
+        mdns.run(HostAnswersMdnsHandler::new(&Host {
+            hostname: hostname,
+            ipv4: stack.config_v4().unwrap().address.address(),
+            ipv6: Ipv6Addr::UNSPECIFIED,
+            ttl: Ttl::from_secs(60)
+        })).await.unwrap();
+    }
+
 }
 
 #[embassy_executor::task]
@@ -302,7 +348,7 @@ async fn ws2812_task(
             }
         }
 
-        Timer::after(Duration::from_millis(1)).await;
+        Timer::after(Duration::from_millis(5)).await;
     }
 }
 
@@ -345,9 +391,7 @@ async fn pixelflute(
     loop {
         let (size, meta) = sock.recv_from(&mut packet).await.unwrap();
         if size < 2 {
-            sock.send_to(b"Pixelflute packet too short", meta.endpoint)
-                .await
-                .unwrap();
+            info!("Pixelflute packet too short");
             continue;
         }
 
@@ -355,25 +399,22 @@ async fn pixelflute(
         let version = packet[1];
 
         info!(
-            "Got pixelflute packet, size: {}, version: {}, format: {}",
-            size, version, format
+            "Got pixelflute packet, from: {} size: {}, version: {}, format: {}",
+            meta.endpoint, size, version, format
         );
 
         if format != 0 && version != 1 {
-            sock.send_to(
-                b"This Pixel flute only supports version 1 with format 0(xyrgb 16:16:8:8:8)",
-                meta.endpoint,
-            )
-            .await
-            .unwrap();
+            info!("This Pixel flute only supports version 1 with format 0(xyrgb 16:16:8:8:8)");
             continue;
         }
 
         for pixel in packet[2..size].chunks_exact(7) {
-            let x = u16::from_le_bytes(pixel[0..2].try_into().unwrap());
-            let y = u16::from_le_bytes(pixel[2..4].try_into().unwrap());
+            let x = u16::from_le_bytes(pixel[0..2].try_into().unwrap()) as usize;
+            let y = u16::from_le_bytes(pixel[2..4].try_into().unwrap()) as usize;
             let rgb = [pixel[4], pixel[5], pixel[6]];
-            pixels.lock().await[(x as usize) % NUM_PIXELS] = rgb;
+            if let Some(pixel) = pixels.lock().await.get_mut(x + y * 10) {
+                *pixel = rgb;
+            }
         }
     }
 }
