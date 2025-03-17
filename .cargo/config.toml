@@ -5,6 +5,7 @@ runner = "espflash flash --monitor"
 ESP_LOG="INFO"
 SSID="Wifi AP name"
 PASSWORD="password"
+HOSTNAME="pixelflute"
 
 
 [build]

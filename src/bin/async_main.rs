@@ -1,16 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::net::{Ipv4Addr, Ipv6Addr};
-
 use alloc::collections::BTreeMap;
-use edge_mdns::buf::VecBufAccess;
-use edge_mdns::domain::base::Ttl;
-use edge_mdns::host::Host;
-use edge_mdns::io::{Mdns, DEFAULT_SOCKET};
-use edge_mdns::HostAnswersMdnsHandler;
-use edge_nal::{UdpBind as _, UdpSplit as _};
-use edge_nal_embassy::{Udp, UdpBuffers};
 use embassy_executor::Spawner;
 use embassy_net::udp::UdpSocket;
 use embassy_net::Stack;
@@ -18,7 +9,6 @@ use embassy_net::{udp::PacketMetadata, IpListenEndpoint, Runner, StackResources}
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel;
 use embassy_sync::mutex::Mutex;
-use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -38,20 +28,16 @@ use esp_wifi::{
     EspWifiController,
 };
 use log::info;
+use ws2812_ping::mdns::mdns_task;
+use ws2812_ping::mk_static;
+use ws2812_ping::net::{start_net, wait_for_dhcp, wait_for_link};
+use ws2812_ping::wifi::start_wifi_sta;
 
 extern crate alloc;
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
-
-macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
-    }};
-}
+const HOSTNAME: &str = env!("HOSTNAME");
 
 type RGB = [u8; 3];
 
@@ -136,7 +122,7 @@ async fn main(spawner: Spawner) {
 
     let events = mk_static!(EventChannel, EventChannel::new());
 
-    let mut rng = Rng::new(peripherals.RNG);
+    let rng = Rng::new(peripherals.RNG);
 
     let ws2812_ctrl = mk_static!(
         WS2812Controller<'_>,
@@ -154,112 +140,26 @@ async fn main(spawner: Spawner) {
     let btn = mk_static!(Input, Input::new(peripherals.GPIO9, Pull::None));
     spawner.must_spawn(btn_task(btn, events.sender()));
 
-    // Setup and spawn wifi stack
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-
-    let esp_wifi_ctrl = &*mk_static!(
-        EspWifiController<'static>,
-        init(timg0.timer0, rng, peripherals.RADIO_CLK).unwrap()
+    // start wifi stack
+    let wifi_sta = start_wifi_sta(
+        spawner,
+        peripherals.TIMG0,
+        rng,
+        peripherals.RADIO_CLK,
+        peripherals.WIFI,
+        SSID,
+        PASSWORD,
     );
 
-    let (wifi_sta, wifi_ctrl) =
-        wifi::new_with_mode(esp_wifi_ctrl, peripherals.WIFI, WifiStaDevice).unwrap();
-    spawner.must_spawn(wifi_ctrl_task(wifi_ctrl));
+    // start network stack
+    let stack = start_net(spawner, rng, wifi_sta);
 
-    // Setup and spawn Network stack
-    let (stack, runner) = embassy_net::new(
-        wifi_sta,
-        embassy_net::Config::dhcpv4(Default::default()),
-        mk_static!(StackResources<5>, StackResources::<5>::new()),
-        (rng.random() as u64) << 32 | rng.random() as u64,
-    );
-    spawner.must_spawn(net_task(runner));
-
-    info!("Waiting for link...");
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
-        Timer::after_millis(500).await;
-    }
-
-    info!("Waiting to get IP address...");
-    loop {
-        if let Some(config) = stack.config_v4() {
-            info!("Got IP: {}", config.address);
-            break;
-        }
-        Timer::after_millis(500).await;
-    }
+    wait_for_link(stack).await;
+    wait_for_dhcp(stack).await;
 
     spawner.must_spawn(pixelping(stack, events.sender()));
     spawner.must_spawn(pixelflute(stack, pixels));
-    spawner.must_spawn(mdns_task(stack, "pixelflute"));
-}
-
-#[embassy_executor::task]
-async fn mdns_task(stack: Stack<'static>, hostname: &'static str) {
-        let mdns_udp_buff = UdpBuffers::<1, 1024, 1024, 1>::new();
-    let mdns_udp = Udp::new(stack, &mdns_udp_buff);
-    let mut mdns_udp_sock = mdns_udp.bind(DEFAULT_SOCKET).await.unwrap();
-    let (mdns_rx, mdns_tx) = mdns_udp_sock.split();
-    let (recv_buf, send_buf) = (
-        VecBufAccess::<NoopRawMutex, 1500>::new(),
-        VecBufAccess::<NoopRawMutex, 1500>::new(),
-    );
-
-    let signal = Signal::<NoopRawMutex, ()>::new();
-
-    let mdns = Mdns::<NoopRawMutex, _, _, _, _>::new(
-        Some(Ipv4Addr::UNSPECIFIED),
-        None,
-        mdns_rx,
-        mdns_tx,
-        recv_buf,
-        send_buf,
-        |buf| buf.iter_mut().for_each(|x| *x = 0),
-        &signal
-    );
-
-    loop {
-        mdns.run(HostAnswersMdnsHandler::new(&Host {
-            hostname: hostname,
-            ipv4: stack.config_v4().unwrap().address.address(),
-            ipv6: Ipv6Addr::UNSPECIFIED,
-            ttl: Ttl::from_secs(60)
-        })).await.unwrap();
-    }
-
-}
-
-#[embassy_executor::task]
-async fn wifi_ctrl_task(mut wifi_ctrl: WifiController<'static>) {
-    wifi_ctrl
-        .set_configuration(&Configuration::Client(ClientConfiguration {
-            ssid: SSID.try_into().unwrap(),
-            password: PASSWORD.try_into().unwrap(),
-            ..Default::default()
-        }))
-        .unwrap();
-
-    wifi_ctrl.start_async().await.unwrap();
-
-    loop {
-        match wifi_ctrl.connect_async().await {
-            Ok(_) => info!("Wifi connected!"),
-            Err(e) => info!("Failed to connect to wifi: {e:?}"),
-        }
-        if wifi_ctrl.is_connected().unwrap() {
-            info!("Waiting for wifi to disconnect");
-            wifi_ctrl.wait_for_event(WifiEvent::StaDisconnected).await;
-        }
-        Timer::after_secs(5).await
-    }
-}
-
-#[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDevice>>) {
-    runner.run().await
+    spawner.must_spawn(mdns_task(stack, HOSTNAME));
 }
 
 #[embassy_executor::task]
